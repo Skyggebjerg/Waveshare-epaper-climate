@@ -9,7 +9,8 @@
  *   1. Wakes up (from a cold boot, from the 2-minute timer, or because
  *      the BOOT button was pressed).
  *   2. Reads the onboard SHTC3 sensor and the PCF85063 RTC.
- *   3. Draws temperature, humidity and the current time on the e-paper.
+ *   3. Draws temperature, humidity, the current time and battery level
+ *      on the e-paper.
  *   4. Goes back into deep sleep for SLEEP_SECONDS. Pressing BOOT while
  *      asleep wakes it immediately instead of waiting out the interval.
  *
@@ -67,16 +68,26 @@ static const int VBAT_PWR_PIN = 17; // battery power latch: must be driven HIGH 
                                      // the board powered; if this ever goes low the
                                      // board switches itself off (same as unplugging it).
 
-// Onboard LED. Not otherwise needed here, but an independent working
-// sketch for this exact board drives it HIGH alongside the two power
-// pins above, every boot, before touching I2C - kept for the same reason
-// (see NOTES.md, "Unexplained but proven").
+// Onboard LED. Doubles as an "awake" indicator: on for the whole time
+// the chip is up and running (from latchBoardPower() below through to
+// goToSleep()), off through deep sleep. It was originally added here for
+// an unrelated, never-fully-confirmed reason (see NOTES.md, "Unexplained
+// but proven") - driving it HIGH at boot, alongside the two power pins,
+// is something an independent working sketch for this exact board does
+// too - but it happens to line up exactly with "on while awake" already.
 static const int LED_PIN = 3;
 
 static const int I2C_SDA_PIN = 47;
 static const int I2C_SCL_PIN = 48;
 
 static const int BOOT_BUTTON_PIN = 0; // wired to ground when pressed
+
+// Battery voltage sense: GPIO4 (ADC1 channel 3), behind a 200k/200k
+// divider (so the real battery voltage is double whatever the ADC pin
+// reads). Confirmed by both Waveshare's own factory firmware
+// (port_adc.cpp, Get_VbatVoltage()/Get_Batterylevel()) and an independent
+// working sketch for this exact board - same pin, same 2x multiplier.
+static const int BATTERY_ADC_PIN = 4;
 
 // ---------------------------------------------------------------------
 // Timing
@@ -94,6 +105,29 @@ Adafruit_SHTC3 shtc3;
 PCF85063A rtc;
 
 bool sensorOk = false;
+
+// ---------------------------------------------------------------------
+// Battery
+// ---------------------------------------------------------------------
+float readBatteryVoltage()
+{
+    analogReadResolution(12);
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+    int mv = analogReadMilliVolts(BATTERY_ADC_PIN);
+    return (mv / 1000.0f) * 2.0f; // undo the 200k/200k divider
+}
+
+// Same thresholds Waveshare's own factory firmware uses (Get_Batterylevel()) -
+// this board's charge circuit tops out a bit under the textbook 4.2V for a
+// LiPo cell, so 0-100% is mapped against 3.0V-4.12V rather than 3.0-4.2V.
+int batteryPercentFromVoltage(float volts)
+{
+    const float VOLT_FULL = 4.12f;
+    const float VOLT_EMPTY = 3.0f;
+    if (volts <= VOLT_EMPTY) return 0;
+    if (volts >= VOLT_FULL) return 100;
+    return (int)((volts - VOLT_EMPTY) / (VOLT_FULL - VOLT_EMPTY) * 100.0f);
+}
 
 // ---------------------------------------------------------------------
 // RTC: detect whether it needs to be set, and set it from the firmware's
@@ -186,8 +220,14 @@ void latchBoardPower()
     pinMode(EPD_PWR_PIN, OUTPUT);
     digitalWrite(EPD_PWR_PIN, LOW);   // power the e-paper panel back up
 
+    // Driving this HIGH (as an independent reference sketch for this board
+    // does) didn't actually light it on the real hardware, so this now
+    // tries the opposite polarity - LOW = on - which is the other common
+    // wiring for a GPIO-driven status LED (GPIO sinks current through the
+    // LED to turn it on, instead of sourcing it). If this still doesn't
+    // light up, GPIO3 may not be a user-visible LED on this board at all.
     pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(LED_PIN, LOW);
 
     delay(10);
 }
@@ -195,15 +235,17 @@ void latchBoardPower()
 // ---------------------------------------------------------------------
 // Draw the current reading to the e-paper panel
 // ---------------------------------------------------------------------
-void drawReadings(int hour, int minute, int day, int month, int year, float tempC, float humidityRH)
+void drawReadings(int hour, int minute, int day, int month, int year, float tempC, float humidityRH, int batteryPercent)
 {
     char timeLine[16];
     char dateLine[16];
     char tempLine[24];
     char humidityLine[24];
+    char batteryLine[8];
 
     snprintf(timeLine, sizeof(timeLine), "%02d:%02d", hour, minute);
     snprintf(dateLine, sizeof(dateLine), "%02d/%02d/%04d", day, month, year);
+    snprintf(batteryLine, sizeof(batteryLine), "%d%%", batteryPercent);
 
     if (sensorOk) {
         snprintf(tempLine, sizeof(tempLine), "%.1f C", tempC);
@@ -219,6 +261,19 @@ void drawReadings(int hour, int minute, int day, int month, int year, float temp
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
+
+        // Battery icon + percentage, top-right corner.
+        display.drawRect(150, 8, 40, 16, GxEPD_BLACK);
+        display.drawRect(151, 9, 38, 14, GxEPD_BLACK);
+        display.fillRect(190, 12, 3, 7, GxEPD_BLACK); // nub
+        int batterySegments = batteryPercent / 20;    // 0-5 bars
+        if (batterySegments > 5) batterySegments = 5;
+        for (int i = 0; i < batterySegments; i++) {
+            display.fillRect(154 + (i * 7), 12, 4, 8, GxEPD_BLACK);
+        }
+        display.setFont(&FreeSans9pt7b);
+        display.setCursor(100, 21);
+        display.print(batteryLine);
 
         display.setFont(&FreeSansBold24pt7b);
         display.setCursor(10, 60);
@@ -246,7 +301,7 @@ void goToSleep()
 {
     display.hibernate();             // put the SSD1681 controller into its own low-power mode
     digitalWrite(EPD_PWR_PIN, HIGH); // cut power to the panel while we sleep
-    digitalWrite(LED_PIN, LOW);
+    digitalWrite(LED_PIN, HIGH);     // LED off (LOW = on - see latchBoardPower())
 
     // Freeze both power pins so they survive deep sleep; without this the
     // board would switch itself off / lose the panel-power state.
@@ -325,14 +380,17 @@ void setup()
         }
     }
 
-    Serial.printf("%02d:%02d %02d/%02d/%04d   %.1f C, %.0f %%RH\n",
-                  hour, minute, day, month, year, tempC, humidityRH);
+    float batteryVoltage = readBatteryVoltage();
+    int batteryPercent = batteryPercentFromVoltage(batteryVoltage);
+
+    Serial.printf("%02d:%02d %02d/%02d/%04d   %.1f C, %.0f %%RH   battery %.2fV (%d%%)\n",
+                  hour, minute, day, month, year, tempC, humidityRH, batteryVoltage, batteryPercent);
 
     SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, EPD_CS_PIN);
     display.epd2.selectSPI(SPI, SPISettings(SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
     display.init(115200);
 
-    drawReadings(hour, minute, day, month, year, tempC, humidityRH);
+    drawReadings(hour, minute, day, month, year, tempC, humidityRH, batteryPercent);
 
     Serial.println("staying awake for 30s with the reading on screen, then sleeping for 2 minutes");
     delay(30000); // keep the just-drawn reading up (and USB/Serial alive) for a bit before sleeping
