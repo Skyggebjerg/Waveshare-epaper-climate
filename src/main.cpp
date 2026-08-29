@@ -32,6 +32,26 @@
  * and the GPIO17/GPIO6 power-latch behaviour come from Waveshare's own
  * example firmware for this board (RTC_Sleep_Test); the GPIO3 line has no
  * confirmed explanation but is cheap to keep — see NOTES.md.
+ *
+ * PARTIAL UPDATE / "VALUE REMEMBERING" - EXPERIMENTAL, NOT YET VERIFIED
+ * ON HARDWARE:
+ * To cut down on the full-screen flashing on every wake, this build
+ * remembers what was last drawn (in RTC memory, which survives deep
+ * sleep) and, from the second wake onward, only asks GxEPD2 to refresh
+ * the smallest band of the screen covering whatever actually changed
+ * (see computeChangedWindow() / the ScreenRect table below), using
+ * GxEPD2's documented `initial_refresh=false` mechanism instead of its
+ * usual full clear.
+ * CAVEAT: that mechanism is normally used when the e-paper panel's own
+ * power was never cut - only the MCU deep-slept. Here EPD_PWR_PIN is cut
+ * every single cycle (deliberately, for battery life), which also wipes
+ * the SSD1681 controller's own internal comparison RAM - something
+ * "remembering values" in the firmware cannot, by itself, restore. In
+ * practice this may work fine, may show a brief artifact on the changed
+ * area right after a wake, or may simply keep flashing regardless - this
+ * hasn't been tested on the real board yet. If it misbehaves, the
+ * reliable fix is the other option discussed: stop cutting panel power
+ * during sleep so the controller's own RAM survives.
  */
 
 #include <Arduino.h>
@@ -39,7 +59,7 @@
 #include <Wire.h>
 #include <math.h>   // NAN
 #include <stdio.h>  // sscanf
-#include <string.h> // strstr
+#include <string.h> // strstr, strcmp, strncpy
 
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeSans9pt7b.h>
@@ -52,6 +72,7 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_sleep.h"
+#include "esp_attr.h" // RTC_DATA_ATTR
 
 // ---------------------------------------------------------------------
 // Board pin map (Waveshare ESP32-S3-ePaper-1.54)
@@ -105,6 +126,45 @@ Adafruit_SHTC3 shtc3;
 PCF85063A rtc;
 
 bool sensorOk = false;
+
+// ---------------------------------------------------------------------
+// Remembered previous frame (RTC memory - survives deep sleep, but is
+// reset to these initializers on a real power-on/reset). Used purely to
+// work out which on-screen fields changed since last wake, so only that
+// area needs a partial refresh. See the big caveat about this near the
+// top of the file.
+// ---------------------------------------------------------------------
+static const uint32_t PREV_FRAME_MAGIC = 0x45504431; // "EPD1"
+
+RTC_DATA_ATTR uint32_t prevFrameMagic = 0;
+RTC_DATA_ATTR char prevTimeLine[16] = "";
+RTC_DATA_ATTR char prevDateLine[16] = "";
+RTC_DATA_ATTR char prevTempLine[24] = "";
+RTC_DATA_ATTR char prevHumidityLine[24] = "";
+RTC_DATA_ATTR char prevBatteryLine[8] = "";
+
+// Fixed screen regions for each field, used to build the smallest
+// bounding box that covers whatever changed. These just need to fully
+// contain what drawReadings() draws at each cursor position below - they
+// don't need to be pixel-tight.
+// Padded generously relative to each font's actual glyph metrics - a few
+// extra blank pixels pushed along for nothing costs little, whereas
+// clipping part of a digit would be a visible bug.
+struct ScreenRect { int16_t x, y, w, h; };
+static const ScreenRect BATTERY_RECT   = { 85,   0, 115, 32 };
+static const ScreenRect TIME_RECT      = {  0,  25, 160, 45 };
+static const ScreenRect DATE_RECT      = {  0,  65, 160, 35 };
+static const ScreenRect TEMP_RECT      = {  0, 115, 200, 50 };
+static const ScreenRect HUMIDITY_RECT  = {  0, 160, 200, 39 };
+
+ScreenRect unionRect(const ScreenRect &a, const ScreenRect &b)
+{
+    int16_t x1 = min(a.x, b.x);
+    int16_t y1 = min(a.y, b.y);
+    int16_t x2 = max((int16_t)(a.x + a.w), (int16_t)(b.x + b.w));
+    int16_t y2 = max((int16_t)(a.y + a.h), (int16_t)(b.y + b.h));
+    return ScreenRect{ x1, y1, (int16_t)(x2 - x1), (int16_t)(y2 - y1) };
+}
 
 // ---------------------------------------------------------------------
 // Battery
@@ -233,30 +293,79 @@ void latchBoardPower()
 }
 
 // ---------------------------------------------------------------------
-// Draw the current reading to the e-paper panel
+// Format the on-screen text for a reading. Kept separate from the actual
+// drawing so the same strings can be compared against the remembered
+// previous frame *before* we decide how to touch the display.
 // ---------------------------------------------------------------------
-void drawReadings(int hour, int minute, int day, int month, int year, float tempC, float humidityRH, int batteryPercent)
-{
+struct ReadingLines {
     char timeLine[16];
     char dateLine[16];
     char tempLine[24];
     char humidityLine[24];
     char batteryLine[8];
+};
 
-    snprintf(timeLine, sizeof(timeLine), "%02d:%02d", hour, minute);
-    snprintf(dateLine, sizeof(dateLine), "%02d/%02d/%04d", day, month, year);
-    snprintf(batteryLine, sizeof(batteryLine), "%d%%", batteryPercent);
+void formatReadingLines(ReadingLines &lines, int hour, int minute, int day, int month, int year,
+                         float tempC, float humidityRH, int batteryPercent)
+{
+    snprintf(lines.timeLine, sizeof(lines.timeLine), "%02d:%02d", hour, minute);
+    snprintf(lines.dateLine, sizeof(lines.dateLine), "%02d/%02d/%04d", day, month, year);
+    snprintf(lines.batteryLine, sizeof(lines.batteryLine), "%d%%", batteryPercent);
 
     if (sensorOk) {
-        snprintf(tempLine, sizeof(tempLine), "%.1f C", tempC);
-        snprintf(humidityLine, sizeof(humidityLine), "RH %.0f %%", humidityRH);
+        snprintf(lines.tempLine, sizeof(lines.tempLine), "%.1f C", tempC);
+        snprintf(lines.humidityLine, sizeof(lines.humidityLine), "RH %.0f %%", humidityRH);
     } else {
-        snprintf(tempLine, sizeof(tempLine), "Sensor offline");
-        humidityLine[0] = '\0';
+        snprintf(lines.tempLine, sizeof(lines.tempLine), "Sensor offline");
+        lines.humidityLine[0] = '\0';
     }
+}
 
+// Compares 'lines' against the remembered previous frame. Returns false
+// if every field is identical (nothing to redraw); otherwise returns
+// true and fills 'out' with the smallest rectangle covering every field
+// that changed.
+bool computeChangedWindow(const ReadingLines &lines, ScreenRect &out)
+{
+    bool any = false;
+    auto includeIfChanged = [&](const char *prev, const char *cur, const ScreenRect &r) {
+        if (strcmp(prev, cur) != 0) {
+            out = any ? unionRect(out, r) : r;
+            any = true;
+        }
+    };
+    includeIfChanged(prevTimeLine, lines.timeLine, TIME_RECT);
+    includeIfChanged(prevDateLine, lines.dateLine, DATE_RECT);
+    includeIfChanged(prevTempLine, lines.tempLine, TEMP_RECT);
+    includeIfChanged(prevHumidityLine, lines.humidityLine, HUMIDITY_RECT);
+    includeIfChanged(prevBatteryLine, lines.batteryLine, BATTERY_RECT);
+    return any;
+}
+
+void rememberFrame(const ReadingLines &lines)
+{
+    strncpy(prevTimeLine, lines.timeLine, sizeof(prevTimeLine));
+    strncpy(prevDateLine, lines.dateLine, sizeof(prevDateLine));
+    strncpy(prevTempLine, lines.tempLine, sizeof(prevTempLine));
+    strncpy(prevHumidityLine, lines.humidityLine, sizeof(prevHumidityLine));
+    strncpy(prevBatteryLine, lines.batteryLine, sizeof(prevBatteryLine));
+    prevFrameMagic = PREV_FRAME_MAGIC;
+}
+
+// ---------------------------------------------------------------------
+// Draw the current reading to the e-paper panel. The whole buffer is
+// always fully redrawn (cheap - it's just text on a 200x200 mono
+// buffer), regardless of window; 'fullWindow'/'window' only control how
+// much of that buffer actually gets pushed to the physical panel.
+// ---------------------------------------------------------------------
+void drawReadings(const ReadingLines &lines, int batteryPercent, bool fullWindow, const ScreenRect &window)
+{
     display.setRotation(0);
-    display.setFullWindow();
+    if (fullWindow) {
+        display.setFullWindow();
+    } else {
+        display.setPartialWindow(window.x, window.y, window.w, window.h);
+    }
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
@@ -273,24 +382,26 @@ void drawReadings(int hour, int minute, int day, int month, int year, float temp
         }
         display.setFont(&FreeSans9pt7b);
         display.setCursor(100, 21);
-        display.print(batteryLine);
+        display.print(lines.batteryLine);
 
         display.setFont(&FreeSansBold24pt7b);
         display.setCursor(10, 60);
-        display.print(timeLine);
+        display.print(lines.timeLine);
 
         display.setFont(&FreeSans12pt7b);
         display.setCursor(10, 95);
-        display.print(dateLine);
+        display.print(lines.dateLine);
 
         display.setFont(&FreeSansBold24pt7b);
         display.setCursor(10, 150);
-        display.print(tempLine);
+        display.print(lines.tempLine);
 
         display.setFont(&FreeSans12pt7b);
         display.setCursor(10, 185);
-        display.print(humidityLine);
+        display.print(lines.humidityLine);
     } while (display.nextPage());
+
+    rememberFrame(lines);
 }
 
 // ---------------------------------------------------------------------
@@ -386,11 +497,32 @@ void setup()
     Serial.printf("%02d:%02d %02d/%02d/%04d   %.1f C, %.0f %%RH   battery %.2fV (%d%%)\n",
                   hour, minute, day, month, year, tempC, humidityRH, batteryVoltage, batteryPercent);
 
-    SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, EPD_CS_PIN);
-    display.epd2.selectSPI(SPI, SPISettings(SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
-    display.init(115200);
+    // Only trust the remembered previous frame if we actually woke from
+    // our own deep sleep (not a fresh power-on/reset, which resets RTC
+    // memory anyway, but this is a cheap extra safety check).
+    esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+    bool wokeFromDeepSleep = (wakeupCause == ESP_SLEEP_WAKEUP_TIMER || wakeupCause == ESP_SLEEP_WAKEUP_EXT1);
+    bool havePrevFrame = wokeFromDeepSleep && (prevFrameMagic == PREV_FRAME_MAGIC);
 
-    drawReadings(hour, minute, day, month, year, tempC, humidityRH, batteryPercent);
+    ReadingLines lines;
+    formatReadingLines(lines, hour, minute, day, month, year, tempC, humidityRH, batteryPercent);
+
+    ScreenRect changedWindow;
+    bool needsUpdate = !havePrevFrame || computeChangedWindow(lines, changedWindow);
+
+    if (needsUpdate) {
+        SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, EPD_CS_PIN);
+        display.epd2.selectSPI(SPI, SPISettings(SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
+        // initial_refresh=false tells GxEPD2 to trust the panel already
+        // shows a valid image and skip its usual full clear on init, so
+        // it goes straight into partial-update mode. Only done when we
+        // actually have a remembered previous frame to diff against -
+        // see the big caveat about this near the top of the file.
+        display.init(115200, !havePrevFrame, 20, false);
+        drawReadings(lines, batteryPercent, !havePrevFrame, changedWindow);
+    } else {
+        Serial.println("Nothing changed since last wake - skipping display update");
+    }
 
     Serial.println("staying awake for 30s with the reading on screen, then sleeping for 2 minutes");
     delay(30000); // keep the just-drawn reading up (and USB/Serial alive) for a bit before sleeping
