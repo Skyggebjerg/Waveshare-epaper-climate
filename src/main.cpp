@@ -113,7 +113,9 @@ static const int BATTERY_ADC_PIN = 4;
 // ---------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------
-static const uint64_t SLEEP_SECONDS = 120; // 2 minutes between updates
+static const uint64_t SLEEP_SECONDS = 120;   // 2 minutes between updates
+static const uint32_t AWAKE_MILLIS = 30000;  // how long to stay awake with the
+                                              // reading on screen before sleeping again
 static const int SPI_CLOCK_HZ = 4000000;
 
 // ---------------------------------------------------------------------
@@ -524,8 +526,9 @@ void setup()
         Serial.println("Nothing changed since last wake - skipping display update");
     }
 
-    Serial.println("staying awake for 30s with the reading on screen, then sleeping for 2 minutes");
-    delay(30000); // keep the just-drawn reading up (and USB/Serial alive) for a bit before sleeping
+    Serial.printf("staying awake for %lums with the reading on screen, then sleeping for %llus\n",
+                  (unsigned long)AWAKE_MILLIS, (unsigned long long)SLEEP_SECONDS);
+    delay(AWAKE_MILLIS); // keep the just-drawn reading up (and USB/Serial alive) for a bit before sleeping
     goToSleep();
 }
 
