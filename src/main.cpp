@@ -1,30 +1,44 @@
 /*
- * Waveshare ESP32-S3-ePaper-1.54 — diagnostic build
+ * Waveshare ESP32-S3-ePaper-1.54 — battery-friendly temperature/humidity display
  * ------------------------------------------------------------------------
- * This is a close port of a working, independent Arduino sketch for this
- * exact board: github.com/VolosR/waveshareEinkMonitor
+ * Board:   https://docs.waveshare.com/ESP32-S3-ePaper-1.54
+ *          1.54" 200x200 monochrome e-paper (SSD1681), onboard SHTC3
+ *          temperature/humidity sensor and PCF85063 real-time clock.
  *
- * What's different from that sketch:
- *   - Its custom bitmap ("background.h") and custom fonts ("fonts.h") are
- *     replaced with plain built-in Adafruit_GFX fonts and a simple text
- *     layout, so there are no extra files to fetch.
- *   - Deep sleep is removed entirely, so USB/Serial stays up and you don't
- *     need to reconnect between tests. It reads once in setup(), then
- *     re-reads and re-prints (but does not redraw the screen) every 5
- *     seconds in loop(), purely so you can watch it on the Serial Monitor
- *     without having to reset the board for every attempt.
+ * What this does:
+ *   1. Wakes up (from a cold boot, from the 2-minute timer, or because
+ *      the BOOT button was pressed).
+ *   2. Reads the onboard SHTC3 sensor and the PCF85063 RTC.
+ *   3. Draws temperature, humidity and the current time on the e-paper.
+ *   4. Goes back into deep sleep for SLEEP_SECONDS. Pressing BOOT while
+ *      asleep wakes it immediately instead of waiting out the interval.
  *
- * Everything else - pin numbers, power-up sequence (including the GPIO3
- * line that has no confirmed explanation but costs nothing to keep),
- * Wire.begin() call, and which RTC/sensor libraries are used - is kept as
- * close to that reference sketch as possible, since it's the one piece of
- * independent evidence we have that this exact hardware works over I2C.
+ * NOTE ON USB: the native USB port fully drops out during deep sleep (the
+ * USB peripheral loses power along with everything else) and only comes
+ * back once the chip actually wakes and re-boots. If you need to upload
+ * new code while it's asleep, hold BOOT, tap RESET, then release BOOT —
+ * this forces USB download mode regardless of sleep state (see README).
+ *
+ * Almost nothing runs in loop() — everything happens once in setup(),
+ * then the chip sleeps. This keeps average power draw low, which matters
+ * because the board runs from a small LiPo cell.
+ *
+ * This firmware is the result of a hands-on debugging session against the
+ * real hardware — see NOTES.md in this project for the full story of how
+ * the sensor/RTC reading was finally made to work (short version: the
+ * lewisxhe/SensorLib library's RTC self-test was failing on this exact
+ * board; swapping to the Soldered PCF85063A library fixed it). Pin map
+ * and the GPIO17/GPIO6 power-latch behaviour come from Waveshare's own
+ * example firmware for this board (RTC_Sleep_Test); the GPIO3 line has no
+ * confirmed explanation but is cheap to keep — see NOTES.md.
  */
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <math.h> // NAN
+#include <math.h>   // NAN
+#include <stdio.h>  // sscanf
+#include <string.h> // strstr
 
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeSans9pt7b.h>
@@ -35,38 +49,153 @@
 #include <PCF85063A-SOLDERED.h> // Soldered PCF85063A RTC library
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 
-// ----------- EPD pins (ESP32-S3) -----------
-#define EPD_DC     10
-#define EPD_CS     11
-#define EPD_SCK    12
-#define EPD_MOSI   13
-#define EPD_RST     9
-#define EPD_BUSY    8
-#define EPD_PWR     6    // ACTIVE-LOW (ON = LOW)
-#define VBAT_PWR   17    // rail enable (ON = HIGH)
+// ---------------------------------------------------------------------
+// Board pin map (Waveshare ESP32-S3-ePaper-1.54)
+// ---------------------------------------------------------------------
+static const int EPD_CS_PIN   = 11;
+static const int EPD_DC_PIN   = 10;
+static const int EPD_RST_PIN  = 9;
+static const int EPD_BUSY_PIN = 8;
+static const int EPD_SCK_PIN  = 12;
+static const int EPD_MOSI_PIN = 13;
+static const int EPD_PWR_PIN  = 6;  // e-paper panel power switch: LOW = on, HIGH = off
 
-// ----------- I2C pins -----------
-#define I2C_SDA    47
-#define I2C_SCL    48
+static const int VBAT_PWR_PIN = 17; // battery power latch: must be driven HIGH to keep
+                                     // the board powered; if this ever goes low the
+                                     // board switches itself off (same as unplugging it).
 
-// ----------- Settings -----------
-#define SPI_CLOCK_HZ 4000000
+// Onboard LED. Not otherwise needed here, but an independent working
+// sketch for this exact board drives it HIGH alongside the two power
+// pins above, every boot, before touching I2C - kept for the same reason
+// (see NOTES.md, "Unexplained but proven").
+static const int LED_PIN = 3;
 
-// ----------- EPD (1.54" D67) -----------
-GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
-    GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
-);
+static const int I2C_SDA_PIN = 47;
+static const int I2C_SCL_PIN = 48;
 
-// ----------- Sensors / RTC -----------
+static const int BOOT_BUTTON_PIN = 0; // wired to ground when pressed
+
+// ---------------------------------------------------------------------
+// Timing
+// ---------------------------------------------------------------------
+static const uint64_t SLEEP_SECONDS = 120; // 2 minutes between updates
+static const int SPI_CLOCK_HZ = 4000000;
+
+// ---------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------
+GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT>
+    display(GxEPD2_154_D67(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
+
 Adafruit_SHTC3 shtc3;
 PCF85063A rtc;
 
-bool rtcOk = false;
 bool sensorOk = false;
 
-// ----------- Draw the reading (plain text, built-in fonts) -----------
-void epdDraw(int hour, int minute, int day, int month, int year, float tempC, float humidityRH)
+// ---------------------------------------------------------------------
+// RTC: detect whether it needs to be set, and set it from the firmware's
+// own build time if so.
+//
+// The Soldered library's own getters mask off and discard the PCF85063's
+// "oscillator stopped" status bit, so we peek at the raw seconds register
+// ourselves just for that one bit - it's the only reliable way to know
+// whether the chip has ever lost backup power (as opposed to just showing
+// an implausible year, which we also check as a backup signal).
+// ---------------------------------------------------------------------
+static const uint8_t PCF85063_ADDR       = 0x51;
+static const uint8_t PCF85063_REG_SECOND = 0x04;
+
+bool pcf85063LostBackupPower()
+{
+    Wire.beginTransmission(PCF85063_ADDR);
+    Wire.write(PCF85063_REG_SECOND);
+    if (Wire.endTransmission(false) != 0) {
+        return true; // couldn't even read it - don't trust it
+    }
+    if (Wire.requestFrom((int)PCF85063_ADDR, 1) != 1) {
+        return true;
+    }
+    uint8_t secondsReg = Wire.read();
+    return (secondsReg & 0x80) != 0;
+}
+
+struct CompileTime {
+    int year, month, day, hour, minute, second;
+};
+
+// Parses the compiler-provided __DATE__ ("Mmm dd yyyy") / __TIME__
+// ("hh:mm:ss") strings, for the fallback below.
+CompileTime parseCompileDateTime()
+{
+    static const char *monthNames = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char monStr[4] = {0};
+    int day = 1, year = 2026, hour = 0, minute = 0, second = 0;
+    sscanf(__DATE__, "%3s %d %d", monStr, &day, &year);
+    sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second);
+    const char *pos = strstr(monthNames, monStr);
+    int month = pos ? (int)((pos - monthNames) / 3) + 1 : 1;
+
+    CompileTime t;
+    t.year = year;
+    t.month = month;
+    t.day = day;
+    t.hour = hour;
+    t.minute = minute;
+    t.second = second;
+    return t;
+}
+
+// The PCF85063 keeps running on its own backup power across our deep
+// sleeps, so normally we do NOT want to touch its clock on every boot.
+// Only fall back to the firmware's build time if the chip lost its
+// backup power (brand new board, or the battery/backup cap was ever
+// fully drained) and is therefore no longer keeping reliable time.
+void initRtcIfNeeded()
+{
+    bool lostPower = pcf85063LostBackupPower();
+    int currentYear = rtc.getYear(); // triggers a real read of the chip
+
+    // Note: this library stores years as an offset from 1970 (not the
+    // more common 2000), so 2024-2069 is the representable "looks like a
+    // real date" range with this particular library's getYear()/setDate().
+    bool yearLooksValid = (currentYear >= 2024 && currentYear <= 2069);
+
+    if (lostPower || !yearLooksValid) {
+        CompileTime t = parseCompileDateTime();
+        rtc.setDate(0, t.day, t.month, t.year); // weekday unused, pass 0
+        rtc.setTime(t.hour, t.minute, t.second);
+        Serial.println("RTC time was not trustworthy - set from firmware build time");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Keep the board powered and bring the e-paper's power rail back up.
+// ---------------------------------------------------------------------
+void latchBoardPower()
+{
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)VBAT_PWR_PIN);
+    gpio_hold_dis((gpio_num_t)EPD_PWR_PIN);
+
+    pinMode(VBAT_PWR_PIN, OUTPUT);
+    digitalWrite(VBAT_PWR_PIN, HIGH); // keep battery power latched on
+
+    pinMode(EPD_PWR_PIN, OUTPUT);
+    digitalWrite(EPD_PWR_PIN, LOW);   // power the e-paper panel back up
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+
+    delay(10);
+}
+
+// ---------------------------------------------------------------------
+// Draw the current reading to the e-paper panel
+// ---------------------------------------------------------------------
+void drawReadings(int hour, int minute, int day, int month, int year, float tempC, float humidityRH)
 {
     char timeLine[16];
     char dateLine[16];
@@ -93,11 +222,11 @@ void epdDraw(int hour, int minute, int day, int month, int year, float tempC, fl
 
         display.setFont(&FreeSansBold24pt7b);
         display.setCursor(10, 60);
-        display.print(rtcOk ? timeLine : "--:--");
+        display.print(timeLine);
 
         display.setFont(&FreeSans12pt7b);
         display.setCursor(10, 95);
-        display.print(rtcOk ? dateLine : "RTC offline");
+        display.print(dateLine);
 
         display.setFont(&FreeSansBold24pt7b);
         display.setCursor(10, 150);
@@ -109,96 +238,108 @@ void epdDraw(int hour, int minute, int day, int month, int year, float tempC, fl
     } while (display.nextPage());
 }
 
-// ----------- Read sensor + RTC, print to Serial -----------
-void readAndPrint(bool draw)
+// ---------------------------------------------------------------------
+// Power everything down and let the ESP32-S3 sleep for SLEEP_SECONDS,
+// or until the BOOT button is pressed - whichever comes first.
+// ---------------------------------------------------------------------
+void goToSleep()
 {
-    int hour = 0, minute = 0, day = 0, month = 0;
-    int year = 0;
+    display.hibernate();             // put the SSD1681 controller into its own low-power mode
+    digitalWrite(EPD_PWR_PIN, HIGH); // cut power to the panel while we sleep
+    digitalWrite(LED_PIN, LOW);
 
-    if (rtcOk) {
-        hour = rtc.getHour();
-        minute = rtc.getMinute();
-        day = rtc.getDay();
-        month = rtc.getMonth();
-        year = rtc.getYear();
-    }
+    // Freeze both power pins so they survive deep sleep; without this the
+    // board would switch itself off / lose the panel-power state.
+    gpio_hold_en((gpio_num_t)VBAT_PWR_PIN);
+    gpio_hold_en((gpio_num_t)EPD_PWR_PIN);
+    gpio_deep_sleep_hold_en();
 
-    float tempC = NAN;
-    float humidityRH = NAN;
-    if (sensorOk) {
-        sensors_event_t hum, temp;
-        bool ok = shtc3.getEvent(&hum, &temp);
-        if (!ok) {
-            delay(5);
-            ok = shtc3.getEvent(&hum, &temp);
-        }
-        if (ok) {
-            tempC = temp.temperature;
-            humidityRH = hum.relative_humidity;
-        }
-    }
+    esp_sleep_enable_timer_wakeup(SLEEP_SECONDS * 1000000ULL);
 
-    Serial.printf("RTC %s: %02d:%02d %02d/%02d/%04d   SHTC3 %s: %.1f C, %.0f %%RH\n",
-                  rtcOk ? "ok" : "OFFLINE", hour, minute, day, month, year,
-                  sensorOk ? "ok" : "OFFLINE", tempC, humidityRH);
+    // BOOT button wakes it immediately too, so you don't have to wait out
+    // the full 2 minutes whenever you want a fresh reading.
+    rtc_gpio_pulldown_dis((gpio_num_t)BOOT_BUTTON_PIN);
+    rtc_gpio_pullup_en((gpio_num_t)BOOT_BUTTON_PIN);
+    esp_sleep_enable_ext1_wakeup(1ULL << BOOT_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
 
-    if (draw) {
-        epdDraw(hour, minute, day, month, year, tempC, humidityRH);
+    esp_deep_sleep_start(); // does not return
+}
+
+void printWakeReason()
+{
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER:
+            Serial.println("Woke up: 2-minute timer");
+            break;
+        case ESP_SLEEP_WAKEUP_EXT1:
+            Serial.println("Woke up: BOOT button press");
+            break;
+        default:
+            Serial.println("Woke up: power-on / reset");
+            break;
     }
 }
 
 void setup()
 {
     Serial.begin(115200);
+    // Give the native USB port a moment to enumerate so early prints aren't
+    // lost when a laptop is connected. Has no effect when running on
+    // battery alone (no host to wait for).
     unsigned long usbWaitStart = millis();
     while (!Serial && millis() - usbWaitStart < 2000) {
         delay(10);
     }
-    Serial.println("\n--- boot (no-sleep diagnostic build) ---");
+    Serial.println("\n--- boot ---");
+    printWakeReason();
 
-    gpio_deep_sleep_hold_dis();
-    gpio_hold_dis((gpio_num_t)VBAT_PWR);
-    gpio_hold_dis((gpio_num_t)EPD_PWR);
+    latchBoardPower();
 
-    // turn on battery
-    pinMode(VBAT_PWR, OUTPUT);
-    digitalWrite(VBAT_PWR, HIGH);
-
-    pinMode(EPD_PWR, OUTPUT);
-    digitalWrite(EPD_PWR, LOW);
-
-    pinMode(3, OUTPUT);
-    digitalWrite(3, HIGH);
-
-    delay(10);
-
-    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     rtc.begin();
-    // A missing PCF85063 doesn't fail loudly here (this library's begin()
-    // doesn't return a status), so we treat it as present and let the
-    // actual reads speak for themselves in the Serial output below.
-    rtcOk = true;
+    initRtcIfNeeded();
 
     sensorOk = shtc3.begin(&Wire);
     if (!sensorOk) {
         Serial.println("SHTC3 sensor not found - check wiring");
     }
 
-    SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+    int hour = rtc.getHour();
+    int minute = rtc.getMinute();
+    int day = rtc.getDay();
+    int month = rtc.getMonth();
+    int year = rtc.getYear();
+
+    float tempC = NAN;
+    float humidityRH = NAN;
+    if (sensorOk) {
+        sensors_event_t humidity, tempEvent;
+        bool ok = shtc3.getEvent(&humidity, &tempEvent);
+        if (!ok) {
+            delay(5);
+            ok = shtc3.getEvent(&humidity, &tempEvent);
+        }
+        if (ok) {
+            tempC = tempEvent.temperature;
+            humidityRH = humidity.relative_humidity;
+        }
+    }
+
+    Serial.printf("%02d:%02d %02d/%02d/%04d   %.1f C, %.0f %%RH\n",
+                  hour, minute, day, month, year, tempC, humidityRH);
+
+    SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, EPD_CS_PIN);
     display.epd2.selectSPI(SPI, SPISettings(SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
     display.init(115200);
 
-    readAndPrint(true);
+    drawReadings(hour, minute, day, month, year, tempC, humidityRH);
 
-    Serial.println("--- staying awake, no deep sleep in this build ---");
+    Serial.println("staying awake for 30s with the reading on screen, then sleeping for 2 minutes");
+    delay(30000); // keep the just-drawn reading up (and USB/Serial alive) for a bit before sleeping
+    goToSleep();
 }
 
 void loop()
 {
-    // Re-read and re-print every 5s so you can watch it on the Serial
-    // Monitor without resetting the board. Does not redraw the e-paper
-    // panel repeatedly (full refreshes are slow and it's not needed for
-    // this test).
-    delay(5000);
-    readAndPrint(false);
+    // Never reached: setup() ends in deep sleep.
 }
