@@ -62,9 +62,14 @@
 #include <string.h> // strstr, strcmp, strncpy
 
 #include <GxEPD2_BW.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSansBold24pt7b.h>
+// Orbitron fonts (Adafruit GFX format). These header files must sit next
+// to this file in src/ (or anywhere on the include path). The symbol name
+// inside each header is assumed to match its filename (the usual
+// fontconvert/truetype2gfx convention) - if your headers name the GFXfont
+// struct differently, adjust the &Orbitron_* references below to match.
+#include "Orbitron_Bold_70.h"    // large number - the RH hero reading
+#include "Orbitron_Bold_32.h"    // medium - temperature and the % sign
+#include "Orbitron_Medium_20.h"  // small - time, date, battery, labels
 
 #include <Adafruit_SHTC3.h>
 #include <PCF85063A-SOLDERED.h> // Soldered PCF85063A RTC library
@@ -152,12 +157,28 @@ RTC_DATA_ATTR char prevBatteryLine[8] = "";
 // Padded generously relative to each font's actual glyph metrics - a few
 // extra blank pixels pushed along for nothing costs little, whereas
 // clipping part of a digit would be a visible bug.
+//
+// Layout (200x200, RH is the hero):
+//   y   0- 29  top strip: time (left, Medium_20) + battery (right)
+//   y  30-147  hero: RH number in Bold_70, centered, with % / RH beside it
+//   y 148-177  temperature in Bold_32
+//   y 178-199  date in Medium_20
 struct ScreenRect { int16_t x, y, w, h; };
-static const ScreenRect BATTERY_RECT   = { 85,   0, 115, 32 };
-static const ScreenRect TIME_RECT      = {  0,  25, 160, 45 };
-static const ScreenRect DATE_RECT      = {  0,  65, 160, 35 };
-static const ScreenRect TEMP_RECT      = {  0, 115, 200, 50 };
-static const ScreenRect HUMIDITY_RECT  = {  0, 160, 200, 39 };
+static const ScreenRect TIME_RECT      = {  0,   0, 100, 30 };
+static const ScreenRect BATTERY_RECT   = { 100,  0, 100, 30 };
+static const ScreenRect HUMIDITY_RECT  = {  0,  30, 200, 114 };
+static const ScreenRect TEMP_RECT      = {  0, 144, 200, 34 };
+static const ScreenRect DATE_RECT      = {  0, 178, 200, 22 };
+
+// Baselines used by drawReadings() - kept next to the rects above so the
+// two stay in sync if the layout is ever rearranged. The hero group, the
+// temperature and the date are all horizontally centered at draw time
+// (measured with getTextBounds), so only vertical positions live here.
+static const int16_t TOP_BASELINE     = 22;  // time + battery %, Medium_20
+static const int16_t HERO_BASELINE    = 112; // RH number and % sign, Bold_70/Bold_32
+static const int16_t HERO_LABEL_DROP  = 36;  // "RH" label baseline sits this far above HERO_BASELINE
+static const int16_t TEMP_BASELINE    = 162; // temperature, Bold_32
+static const int16_t DATE_BASELINE    = 196; // date, Medium_20
 
 ScreenRect unionRect(const ScreenRect &a, const ScreenRect &b)
 {
@@ -316,10 +337,12 @@ void formatReadingLines(ReadingLines &lines, int hour, int minute, int day, int 
 
     if (sensorOk) {
         snprintf(lines.tempLine, sizeof(lines.tempLine), "%.1f C", tempC);
-        snprintf(lines.humidityLine, sizeof(lines.humidityLine), "RH %.0f %%", humidityRH);
+        // Just the number - the % and RH labels are drawn separately in
+        // smaller fonts next to it (the hero font is too big for both).
+        snprintf(lines.humidityLine, sizeof(lines.humidityLine), "%.0f", humidityRH);
     } else {
         snprintf(lines.tempLine, sizeof(lines.tempLine), "Sensor offline");
-        lines.humidityLine[0] = '\0';
+        snprintf(lines.humidityLine, sizeof(lines.humidityLine), "--");
     }
 }
 
@@ -368,39 +391,92 @@ void drawReadings(const ReadingLines &lines, int batteryPercent, bool fullWindow
     } else {
         display.setPartialWindow(window.x, window.y, window.w, window.h);
     }
+    // Measure everything that gets centered up front (getTextBounds needs
+    // the right font selected, but not an open page).
+    int16_t bx, by;
+    uint16_t heroW, heroH, pctW, pctH, rhW, rhH, tempW, tempH, dateW, dateH;
+
+    display.setFont(&Orbitron_Bold_70);
+    display.getTextBounds(lines.humidityLine, 0, HERO_BASELINE, &bx, &by, &heroW, &heroH);
+    display.setFont(&Orbitron_Bold_32);
+    display.getTextBounds("%", 0, HERO_BASELINE, &bx, &by, &pctW, &pctH);
+    display.setFont(&Orbitron_Medium_20);
+    display.getTextBounds("RH", 0, HERO_BASELINE, &bx, &by, &rhW, &rhH);
+
+    if (sensorOk) {
+        display.setFont(&Orbitron_Bold_32);
+    } else {
+        display.setFont(&Orbitron_Medium_20); // "Sensor offline" is too wide for Bold_32
+    }
+    display.getTextBounds(lines.tempLine, 0, TEMP_BASELINE, &bx, &by, &tempW, &tempH);
+    display.setFont(&Orbitron_Medium_20);
+    display.getTextBounds(lines.dateLine, 0, DATE_BASELINE, &bx, &by, &dateW, &dateH);
+
+    // Hero group = big number + a right-hand column holding "RH" stacked
+    // tightly over "%". The whole group is centered as one unit.
+    const int16_t heroGap = 6; // gap between the number and the RH/% column
+    uint16_t colW = max(pctW, rhW);
+    int16_t heroX = (200 - (int16_t)(heroW + heroGap + colW)) / 2;
+    if (heroX < 0) heroX = 0;
+    int16_t colX = heroX + heroW + heroGap;
+    int16_t tempX = (200 - (int16_t)tempW) / 2; if (tempX < 0) tempX = 0;
+    int16_t dateX = (200 - (int16_t)dateW) / 2; if (dateX < 0) dateX = 0;
+
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
 
-        // Battery icon + percentage, top-right corner.
-        display.drawRect(150, 8, 40, 16, GxEPD_BLACK);
-        display.drawRect(151, 9, 38, 14, GxEPD_BLACK);
-        display.fillRect(190, 12, 3, 7, GxEPD_BLACK); // nub
+        // --- Top strip: time (left), battery (right), separator below ---
+        display.setFont(&Orbitron_Medium_20);
+        display.setCursor(2, TOP_BASELINE);
+        display.print(lines.timeLine);
+
+        // Battery icon, top-right corner, with the percentage to its left
+        // (right-aligned against the icon so 2- and 3-digit values both fit).
+        display.drawRect(157, 6, 38, 16, GxEPD_BLACK);
+        display.fillRect(195, 10, 4, 8, GxEPD_BLACK); // nub
         int batterySegments = batteryPercent / 20;    // 0-5 bars
         if (batterySegments > 5) batterySegments = 5;
         for (int i = 0; i < batterySegments; i++) {
-            display.fillRect(154 + (i * 7), 12, 4, 8, GxEPD_BLACK);
+            display.fillRect(160 + (i * 7), 9, 5, 10, GxEPD_BLACK);
         }
-        display.setFont(&FreeSans9pt7b);
-        display.setCursor(100, 21);
+        int16_t batX, batY;
+        uint16_t batW, batH;
+        display.getTextBounds(lines.batteryLine, 0, TOP_BASELINE, &batX, &batY, &batW, &batH);
+        display.setCursor(152 - (int16_t)batW, TOP_BASELINE);
         display.print(lines.batteryLine);
 
-        display.setFont(&FreeSansBold24pt7b);
-        display.setCursor(10, 60);
-        display.print(lines.timeLine);
+        display.drawFastHLine(0, 28, 200, GxEPD_BLACK); // separator under the status strip
 
-        display.setFont(&FreeSans12pt7b);
-        display.setCursor(10, 95);
-        display.print(lines.dateLine);
+        // --- Hero: the RH reading, big and centered as one group ---
+        display.setFont(&Orbitron_Bold_70);
+        display.setCursor(heroX, HERO_BASELINE);
+        display.print(lines.humidityLine);
 
-        display.setFont(&FreeSansBold24pt7b);
-        display.setCursor(10, 150);
+        // "%" bottom-aligned with the number; "RH" sitting tightly above
+        // it, centered over the % so the column reads as one label.
+        display.setFont(&Orbitron_Bold_32);
+        display.setCursor(colX + (colW - pctW) / 2, HERO_BASELINE);
+        display.print("%");
+
+        display.setFont(&Orbitron_Medium_20);
+        display.setCursor(colX + (colW - rhW) / 2, HERO_BASELINE - HERO_LABEL_DROP);
+        display.print("RH");
+
+        // --- Temperature, centered ---
+        if (sensorOk) {
+            display.setFont(&Orbitron_Bold_32);
+        } else {
+            display.setFont(&Orbitron_Medium_20);
+        }
+        display.setCursor(tempX, TEMP_BASELINE);
         display.print(lines.tempLine);
 
-        display.setFont(&FreeSans12pt7b);
-        display.setCursor(10, 185);
-        display.print(lines.humidityLine);
+        // --- Date, centered ---
+        display.setFont(&Orbitron_Medium_20);
+        display.setCursor(dateX, DATE_BASELINE);
+        display.print(lines.dateLine);
     } while (display.nextPage());
 
     rememberFrame(lines);
