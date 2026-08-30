@@ -33,24 +33,26 @@
  * example firmware for this board (RTC_Sleep_Test); the GPIO3 line has no
  * confirmed explanation but is cheap to keep — see NOTES.md.
  *
- * PARTIAL UPDATE / FRAME DIFFING (confirmed working on hardware):
- * To cut down on the full-screen flashing on every wake, each frame is
- * first rendered into an off-screen canvas, then compared pixel-for-pixel
- * against a copy of the previously-shown frame kept in RTC memory (which
- * survives deep sleep - 5000 bytes, most of the ESP32-S3's 8KB RTC
- * budget). Only the bounding box of the pixels that actually differ is
- * pushed to the panel as a partial (non-flashing) update; if nothing
- * differs, the panel isn't touched at all. Because the diff works on the
- * real pixels rather than a hand-maintained table of screen regions, the
- * layout (baselines, positions, fonts) can be rearranged freely without
- * breaking partial updates.
- * Partial refreshes leave residue behind ("ghosting"/graininess -
- * confirmed on this panel), so after every FULL_REFRESH_EVERY partial
- * updates one full flashing refresh is forced to clean the panel.
- * NOTE: GxEPD2 is initialized with initial_refresh=false when a
- * remembered frame exists - normally that mechanism assumes the panel's
- * power was never cut, whereas this firmware cuts it every cycle for
- * battery life; empirically it works well on this exact board anyway.
+ * PARTIAL UPDATE / "VALUE REMEMBERING" (the approach proven on hardware):
+ * To cut down on the full-screen flashing on every wake, the firmware
+ * remembers the text it last drew for each field (in RTC memory, which
+ * survives deep sleep) and, from the second wake onward, only refreshes
+ * the fixed screen region(s) belonging to the field(s) whose text
+ * actually changed, via GxEPD2's setPartialWindow + initial_refresh=false
+ * path. If nothing changed, the display isn't touched at all.
+ * History note: a fancier full-frame pixel-diff variant (tight bounding
+ * boxes computed from an off-screen canvas, including one flavor that
+ * rewrote the whole controller RAM through epd2.writeImage before each
+ * partial refresh) was tried and caused edge graininess on the real
+ * panel with longer sleep intervals; this per-field-region approach is
+ * the one that has actually run clean on this hardware, so it stays.
+ * CONSEQUENCE: the *_RECT table below is a hand-maintained mirror of the
+ * layout. If a *_BASELINE (or any drawing position) moves by more than a
+ * few pixels, the matching rect must move with it - a field drawn
+ * outside its own rect leaves stale pixels behind on partial updates.
+ * Partial refreshes also leave residue behind over time ("ghosting"),
+ * so a full flashing refresh is forced when either FULL_REFRESH_* limit
+ * below is hit.
  */
 
 #include <Arduino.h>
@@ -121,11 +123,16 @@ static const uint64_t SLEEP_SECONDS = 300;   // 2 minutes between updates
 static const uint32_t AWAKE_MILLIS = 15000;  // how long to stay awake with the
                                               // reading on screen before sleeping again
 // Partial refreshes never fully reset the panel's pixels, so residue
-// ("ghosting"/graininess) builds up over many cycles. Every this-many
-// partial updates, one full flashing refresh is forced to clean it off.
-// Lower = cleaner screen but more flashing; raise it if the flashing
-// bothers you more than the graininess.
-static const uint32_t FULL_REFRESH_EVERY = 15;
+// ("ghosting"/graininess) builds up - and it accumulates with elapsed
+// TIME as much as with update count (the image physically decays while
+// the panel sits unpowered, and the border ring isn't cleanly driven by
+// partial refreshes, which is why the edges gray out first). So a full
+// flashing refresh is forced when EITHER limit is hit, whichever comes
+// first - and because the main limit is time-based, changing
+// SLEEP_SECONDS no longer stretches the interval between cleanups:
+static const uint32_t FULL_REFRESH_AFTER_SECONDS = 1800; // ~30 min of accumulated sleep
+static const uint32_t FULL_REFRESH_EVERY = 15;           // backstop: many rapid partials (e.g. button presses)
+// Lower either value = cleaner screen but more flashing; raise = the opposite.
 static const int SPI_CLOCK_HZ = 4000000;
 
 // ---------------------------------------------------------------------
@@ -141,38 +148,60 @@ bool sensorOk = false;
 
 // ---------------------------------------------------------------------
 // Remembered previous frame (RTC memory - survives deep sleep, reset on
-// a real power-on/reset). A complete 1-bit copy of what the panel is
-// showing: 200x200 / 8 = 5000 bytes, most of the ESP32-S3's 8KB RTC
-// memory budget. Each new frame is rendered into an off-screen canvas
-// and diffed against this pixel-for-pixel, so the changed region is
-// computed from the actual pixels - the layout (baselines, positions,
-// fonts) can be rearranged freely without breaking partial updates.
+// a real power-on/reset). One string per on-screen field: what was drawn
+// last time, so only fields whose text changed get refreshed.
 // ---------------------------------------------------------------------
 static const int SCREEN_W = 200;
 static const int SCREEN_H = 200;
-static const int SCREEN_ROW_BYTES = SCREEN_W / 8; // 25
-static const uint32_t PREV_FRAME_MAGIC = 0x45504432; // "EPD2" - bumped when the diff scheme changed
+static const uint32_t PREV_FRAME_MAGIC = 0x45504433; // "EPD3" - bumped when the scheme changed
 
 RTC_DATA_ATTR uint32_t prevFrameMagic = 0;
-RTC_DATA_ATTR uint32_t partialCyclesSinceFull = 0; // ghosting control - see FULL_REFRESH_EVERY
-RTC_DATA_ATTR uint8_t prevFrame[SCREEN_ROW_BYTES * SCREEN_H]; // 5000 bytes
-
-// Off-screen canvas each new frame is composed on before being diffed
-// against prevFrame and pushed to the panel.
-// Convention: bit set (color 1) = black ink, bit clear = white paper.
-GFXcanvas1 frameCanvas(SCREEN_W, SCREEN_H);
+RTC_DATA_ATTR uint32_t partialCyclesSinceFull = 0;  // ghosting control - see FULL_REFRESH_EVERY
+RTC_DATA_ATTR uint32_t sleepSecondsSinceFull = 0;   // ghosting control - see FULL_REFRESH_AFTER_SECONDS
+RTC_DATA_ATTR char prevTimeLine[16] = "";
+RTC_DATA_ATTR char prevDateLine[16] = "";
+RTC_DATA_ATTR char prevTempLine[24] = "";
+RTC_DATA_ATTR char prevHumidityLine[24] = "";
+RTC_DATA_ATTR char prevBatteryLine[8] = "";
 
 struct ScreenRect { int16_t x, y, w, h; };
 
-// Vertical layout. Move any of these freely - the pixel diff picks up
-// whatever actually changed, so nothing else needs to be kept in sync.
-// Everything except the top strip is horizontally centered at draw time
-// (measured with getTextBounds).
+// Vertical layout. Everything except the top strip is horizontally
+// centered at draw time (measured with getTextBounds), so only vertical
+// positions live here.
 static const int16_t TOP_BASELINE     = 22;  // time + battery %, Medium_20
 static const int16_t HERO_BASELINE    = 112; // RH number and % sign, Bold_70/Bold_32
 static const int16_t HERO_LABEL_DROP  = 36;  // "RH" label baseline sits this far above HERO_BASELINE
 static const int16_t TEMP_BASELINE    = 162; // temperature, Bold_32
 static const int16_t DATE_BASELINE    = 196; // date, Medium_20
+
+// Fixed screen region per field - the area refreshed when that field's
+// text changes. KEEP IN SYNC WITH THE BASELINES ABOVE: each rect must
+// fully contain everything its field draws (glyphs are padded a few px
+// here; a field drawn outside its own rect leaves stale pixels behind
+// on partial updates). Full-width rects for the centered fields, since
+// their x position shifts with the text width.
+//
+// Derived from the baselines above and the observed Orbitron glyph
+// heights (~52px for Bold_70 digits, ~30px for Bold_32, ~20px Medium_20):
+//   time/battery: strip y 0-29 (glyph tops ~2, separator line at y28)
+//   hero:  digits top ~60, RH label top ~60 (baseline 76), bottom 112
+//   temp:  top ~132 (baseline 162), no descenders
+//   date:  top ~176 (baseline 196)
+static const ScreenRect TIME_RECT     = {   0,   0, 100,  30 };
+static const ScreenRect BATTERY_RECT  = { 100,   0, 100,  30 };
+static const ScreenRect HUMIDITY_RECT = {   0,  48, 200,  76 }; // y 48-124
+static const ScreenRect TEMP_RECT     = {   0, 126, 200,  46 }; // y 126-172
+static const ScreenRect DATE_RECT     = {   0, 174, 200,  26 }; // y 174-200
+
+ScreenRect unionRect(const ScreenRect &a, const ScreenRect &b)
+{
+    int16_t x1 = min(a.x, b.x);
+    int16_t y1 = min(a.y, b.y);
+    int16_t x2 = max((int16_t)(a.x + a.w), (int16_t)(b.x + b.w));
+    int16_t y2 = max((int16_t)(a.y + a.h), (int16_t)(b.y + b.h));
+    return ScreenRect{ x1, y1, (int16_t)(x2 - x1), (int16_t)(y2 - y1) };
+}
 
 // ---------------------------------------------------------------------
 // Battery
@@ -331,37 +360,72 @@ void formatReadingLines(ReadingLines &lines, int hour, int minute, int day, int 
     }
 }
 
-// ---------------------------------------------------------------------
-// Render the complete frame into the off-screen canvas. Nothing touches
-// the physical display here - this is pure drawing, so the result can be
-// diffed against the previous frame before deciding what to push.
-// Canvas convention: color 1 = black ink, 0 = white paper.
-// ---------------------------------------------------------------------
-void renderFrame(const ReadingLines &lines, int batteryPercent)
+// Compares 'lines' against the remembered previous frame. Returns false
+// if every field is identical (nothing to redraw); otherwise returns
+// true and fills 'out' with the smallest rectangle covering every field
+// that changed.
+bool computeChangedWindow(const ReadingLines &lines, ScreenRect &out)
 {
-    frameCanvas.fillScreen(0);
-    frameCanvas.setTextColor(1);
+    bool any = false;
+    auto includeIfChanged = [&](const char *prev, const char *cur, const ScreenRect &r) {
+        if (strcmp(prev, cur) != 0) {
+            out = any ? unionRect(out, r) : r;
+            any = true;
+        }
+    };
+    includeIfChanged(prevTimeLine, lines.timeLine, TIME_RECT);
+    includeIfChanged(prevDateLine, lines.dateLine, DATE_RECT);
+    includeIfChanged(prevTempLine, lines.tempLine, TEMP_RECT);
+    includeIfChanged(prevHumidityLine, lines.humidityLine, HUMIDITY_RECT);
+    includeIfChanged(prevBatteryLine, lines.batteryLine, BATTERY_RECT);
+    return any;
+}
 
-    // Measure everything that gets centered (getTextBounds needs the
-    // right font selected on the canvas first).
+void rememberFrame(const ReadingLines &lines)
+{
+    strncpy(prevTimeLine, lines.timeLine, sizeof(prevTimeLine));
+    strncpy(prevDateLine, lines.dateLine, sizeof(prevDateLine));
+    strncpy(prevTempLine, lines.tempLine, sizeof(prevTempLine));
+    strncpy(prevHumidityLine, lines.humidityLine, sizeof(prevHumidityLine));
+    strncpy(prevBatteryLine, lines.batteryLine, sizeof(prevBatteryLine));
+    prevFrameMagic = PREV_FRAME_MAGIC;
+}
+
+// ---------------------------------------------------------------------
+// Draw the current reading to the e-paper panel. The whole buffer is
+// always fully redrawn (cheap - it's just text on a 200x200 mono
+// buffer); 'fullWindow'/'window' only control how much of it actually
+// gets pushed to the physical panel.
+// ---------------------------------------------------------------------
+void drawReadings(const ReadingLines &lines, int batteryPercent, bool fullWindow, const ScreenRect &window)
+{
+    display.setRotation(0);
+    if (fullWindow) {
+        display.setFullWindow();
+    } else {
+        display.setPartialWindow(window.x, window.y, window.w, window.h);
+    }
+
+    // Measure everything that gets centered up front (getTextBounds needs
+    // the right font selected, but not an open page).
     int16_t bx, by;
     uint16_t heroW, heroH, pctW, pctH, rhW, rhH, tempW, tempH, dateW, dateH;
 
-    frameCanvas.setFont(&Orbitron_Bold_70);
-    frameCanvas.getTextBounds(lines.humidityLine, 0, HERO_BASELINE, &bx, &by, &heroW, &heroH);
-    frameCanvas.setFont(&Orbitron_Bold_32);
-    frameCanvas.getTextBounds("%", 0, HERO_BASELINE, &bx, &by, &pctW, &pctH);
-    frameCanvas.setFont(&Orbitron_Medium_20);
-    frameCanvas.getTextBounds("RH", 0, HERO_BASELINE, &bx, &by, &rhW, &rhH);
+    display.setFont(&Orbitron_Bold_70);
+    display.getTextBounds(lines.humidityLine, 0, HERO_BASELINE, &bx, &by, &heroW, &heroH);
+    display.setFont(&Orbitron_Bold_32);
+    display.getTextBounds("%", 0, HERO_BASELINE, &bx, &by, &pctW, &pctH);
+    display.setFont(&Orbitron_Medium_20);
+    display.getTextBounds("RH", 0, HERO_BASELINE, &bx, &by, &rhW, &rhH);
 
     if (sensorOk) {
-        frameCanvas.setFont(&Orbitron_Bold_32);
+        display.setFont(&Orbitron_Bold_32);
     } else {
-        frameCanvas.setFont(&Orbitron_Medium_20); // "Sensor offline" is too wide for Bold_32
+        display.setFont(&Orbitron_Medium_20); // "Sensor offline" is too wide for Bold_32
     }
-    frameCanvas.getTextBounds(lines.tempLine, 0, TEMP_BASELINE, &bx, &by, &tempW, &tempH);
-    frameCanvas.setFont(&Orbitron_Medium_20);
-    frameCanvas.getTextBounds(lines.dateLine, 0, DATE_BASELINE, &bx, &by, &dateW, &dateH);
+    display.getTextBounds(lines.tempLine, 0, TEMP_BASELINE, &bx, &by, &tempW, &tempH);
+    display.setFont(&Orbitron_Medium_20);
+    display.getTextBounds(lines.dateLine, 0, DATE_BASELINE, &bx, &by, &dateW, &dateH);
 
     // Hero group = big number + a right-hand column holding "RH" stacked
     // tightly over "%". The whole group is centered as one unit.
@@ -373,121 +437,73 @@ void renderFrame(const ReadingLines &lines, int batteryPercent)
     int16_t tempX = (SCREEN_W - (int16_t)tempW) / 2; if (tempX < 0) tempX = 0;
     int16_t dateX = (SCREEN_W - (int16_t)dateW) / 2; if (dateX < 0) dateX = 0;
 
-    // --- Top strip: time (left), battery (right), separator below ---
-    frameCanvas.setFont(&Orbitron_Medium_20);
-    frameCanvas.setCursor(2, TOP_BASELINE);
-    frameCanvas.print(lines.timeLine);
-
-    // Battery icon, top-right corner, with the percentage to its left
-    // (right-aligned against the icon so 2- and 3-digit values both fit).
-    frameCanvas.drawRect(157, 6, 38, 16, 1);
-    frameCanvas.fillRect(195, 10, 4, 8, 1); // nub
-    int batterySegments = batteryPercent / 20;    // 0-5 bars
-    if (batterySegments > 5) batterySegments = 5;
-    for (int i = 0; i < batterySegments; i++) {
-        frameCanvas.fillRect(160 + (i * 7), 9, 5, 10, 1);
-    }
-    int16_t batX, batY;
-    uint16_t batW, batH;
-    frameCanvas.getTextBounds(lines.batteryLine, 0, TOP_BASELINE, &batX, &batY, &batW, &batH);
-    frameCanvas.setCursor(152 - (int16_t)batW, TOP_BASELINE);
-    frameCanvas.print(lines.batteryLine);
-
-    frameCanvas.drawFastHLine(0, 28, SCREEN_W, 1); // separator under the status strip
-
-    // --- Hero: the RH reading, big and centered as one group ---
-    frameCanvas.setFont(&Orbitron_Bold_70);
-    frameCanvas.setCursor(heroX, HERO_BASELINE);
-    frameCanvas.print(lines.humidityLine);
-
-    // "%" bottom-aligned with the number; "RH" sitting tightly above
-    // it, centered over the % so the column reads as one label.
-    frameCanvas.setFont(&Orbitron_Bold_32);
-    frameCanvas.setCursor(colX + (colW - pctW) / 2, HERO_BASELINE);
-    frameCanvas.print("%");
-
-    frameCanvas.setFont(&Orbitron_Medium_20);
-    frameCanvas.setCursor(colX + (colW - rhW) / 2, HERO_BASELINE - HERO_LABEL_DROP);
-    frameCanvas.print("RH");
-
-    // --- Temperature, centered ---
-    if (sensorOk) {
-        frameCanvas.setFont(&Orbitron_Bold_32);
-    } else {
-        frameCanvas.setFont(&Orbitron_Medium_20);
-    }
-    frameCanvas.setCursor(tempX, TEMP_BASELINE);
-    frameCanvas.print(lines.tempLine);
-
-    // --- Date, centered ---
-    frameCanvas.setFont(&Orbitron_Medium_20);
-    frameCanvas.setCursor(dateX, DATE_BASELINE);
-    frameCanvas.print(lines.dateLine);
-}
-
-// ---------------------------------------------------------------------
-// Pixel diff: compare the freshly-rendered canvas against the previous
-// frame remembered in RTC memory. Returns false if they're identical;
-// otherwise returns true and fills 'out' with the bounding box of every
-// pixel that differs (x/w byte-aligned, which suits the panel anyway).
-// ---------------------------------------------------------------------
-bool diffFrames(ScreenRect &out)
-{
-    const uint8_t *cur = frameCanvas.getBuffer();
-    int minRow = SCREEN_H, maxRow = -1;
-    int minByte = SCREEN_ROW_BYTES, maxByte = -1;
-
-    for (int row = 0; row < SCREEN_H; row++) {
-        const uint8_t *a = cur + row * SCREEN_ROW_BYTES;
-        const uint8_t *b = prevFrame + row * SCREEN_ROW_BYTES;
-        for (int col = 0; col < SCREEN_ROW_BYTES; col++) {
-            if (a[col] != b[col]) {
-                if (row < minRow) minRow = row;
-                if (row > maxRow) maxRow = row;
-                if (col < minByte) minByte = col;
-                if (col > maxByte) maxByte = col;
-            }
-        }
-    }
-    if (maxRow < 0) return false;
-
-    out.x = (int16_t)(minByte * 8);
-    out.y = (int16_t)minRow;
-    out.w = (int16_t)((maxByte - minByte + 1) * 8);
-    out.h = (int16_t)(maxRow - minRow + 1);
-    return true;
-}
-
-// ---------------------------------------------------------------------
-// Push the rendered canvas to the e-paper panel - either the full screen
-// (flashing refresh, resets every pixel) or just the given window
-// (partial, non-flashing) - then remember this frame as the new baseline.
-// ---------------------------------------------------------------------
-void pushFrameToDisplay(bool fullWindow, const ScreenRect &window)
-{
-    display.setRotation(0);
-    if (fullWindow) {
-        display.setFullWindow();
-    } else {
-        display.setPartialWindow(window.x, window.y, window.w, window.h);
-    }
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
-        // Draw the canvas's set bits (ink) in black over the white fill.
-        display.drawBitmap(0, 0, frameCanvas.getBuffer(), SCREEN_W, SCREEN_H, GxEPD_BLACK);
+        display.setTextColor(GxEPD_BLACK);
+
+        // --- Top strip: time (left), battery (right), separator below ---
+        display.setFont(&Orbitron_Medium_20);
+        display.setCursor(2, TOP_BASELINE);
+        display.print(lines.timeLine);
+
+        // Battery icon, top-right corner, with the percentage to its left
+        // (right-aligned against the icon so 2- and 3-digit values both fit).
+        display.drawRect(157, 6, 38, 16, GxEPD_BLACK);
+        display.fillRect(195, 10, 4, 8, GxEPD_BLACK); // nub
+        int batterySegments = batteryPercent / 20;    // 0-5 bars
+        if (batterySegments > 5) batterySegments = 5;
+        for (int i = 0; i < batterySegments; i++) {
+            display.fillRect(160 + (i * 7), 9, 5, 10, GxEPD_BLACK);
+        }
+        int16_t batX, batY;
+        uint16_t batW, batH;
+        display.getTextBounds(lines.batteryLine, 0, TOP_BASELINE, &batX, &batY, &batW, &batH);
+        display.setCursor(152 - (int16_t)batW, TOP_BASELINE);
+        display.print(lines.batteryLine);
+
+        display.drawFastHLine(0, 28, SCREEN_W, GxEPD_BLACK); // separator under the status strip
+
+        // --- Hero: the RH reading, big and centered as one group ---
+        display.setFont(&Orbitron_Bold_70);
+        display.setCursor(heroX, HERO_BASELINE);
+        display.print(lines.humidityLine);
+
+        // "%" bottom-aligned with the number; "RH" sitting tightly above
+        // it, centered over the % so the column reads as one label.
+        display.setFont(&Orbitron_Bold_32);
+        display.setCursor(colX + (colW - pctW) / 2, HERO_BASELINE);
+        display.print("%");
+
+        display.setFont(&Orbitron_Medium_20);
+        display.setCursor(colX + (colW - rhW) / 2, HERO_BASELINE - HERO_LABEL_DROP);
+        display.print("RH");
+
+        // --- Temperature, centered ---
+        if (sensorOk) {
+            display.setFont(&Orbitron_Bold_32);
+        } else {
+            display.setFont(&Orbitron_Medium_20);
+        }
+        display.setCursor(tempX, TEMP_BASELINE);
+        display.print(lines.tempLine);
+
+        // --- Date, centered ---
+        display.setFont(&Orbitron_Medium_20);
+        display.setCursor(dateX, DATE_BASELINE);
+        display.print(lines.dateLine);
     } while (display.nextPage());
 
     // Ghosting bookkeeping: a full-window update uses the full flashing
     // waveform, which resets every pixel and clears accumulated residue.
     if (fullWindow) {
         partialCyclesSinceFull = 0;
+        sleepSecondsSinceFull = 0;
     } else {
         partialCyclesSinceFull++;
     }
 
-    memcpy(prevFrame, frameCanvas.getBuffer(), sizeof(prevFrame));
-    prevFrameMagic = PREV_FRAME_MAGIC;
+    rememberFrame(lines);
 }
 
 // ---------------------------------------------------------------------
@@ -496,12 +512,24 @@ void pushFrameToDisplay(bool fullWindow, const ScreenRect &window)
 // ---------------------------------------------------------------------
 void goToSleep()
 {
-    display.hibernate();             // put the SSD1681 controller into its own low-power mode
-    digitalWrite(EPD_PWR_PIN, HIGH); // cut power to the panel while we sleep
+    // Put the SSD1681 into its own deep-sleep mode: high-voltage drivers
+    // off, ~1uA draw, and - the important part - its internal RAM is
+    // RETAINED. That retained RAM is what partial updates diff against,
+    // so the panel's power rail deliberately stays ON through deep sleep
+    // (EPD_PWR_PIN stays LOW): this is the standard GxEPD2 low-power
+    // flow that partial updates are designed for.
+    //
+    // Earlier versions cut EPD_PWR here to save that last ~1uA. That was
+    // the root cause of a long-chased bug: with the controller fully
+    // unpowered, its RAM decays - slowly enough that ~2-minute sleeps
+    // happened to work, but ~5-minute sleeps woke to garbage and every
+    // partial refresh then dirtied the panel (grainy edges). ~1uA next
+    // to the ESP32's own ~20-30uA deep-sleep draw is not worth that.
+    display.hibernate();
     digitalWrite(LED_PIN, HIGH);     // LED off (LOW = on - see latchBoardPower())
 
-    // Freeze both power pins so they survive deep sleep; without this the
-    // board would switch itself off / lose the panel-power state.
+    // Freeze both power pins so they survive deep sleep: VBAT latch HIGH
+    // (board stays powered), EPD_PWR LOW (panel rail stays on, see above).
     gpio_hold_en((gpio_num_t)VBAT_PWR_PIN);
     gpio_hold_en((gpio_num_t)EPD_PWR_PIN);
     gpio_deep_sleep_hold_en();
@@ -593,25 +621,32 @@ void setup()
     ReadingLines lines;
     formatReadingLines(lines, hour, minute, day, month, year, tempC, humidityRH, batteryPercent);
 
-    // Every FULL_REFRESH_EVERY partial updates, force one full flashing
-    // refresh to clear the residue ("ghosting") that partial updates
-    // leave behind - without this the screen slowly turns grainy.
-    bool forceFullRefresh = !havePrevFrame || (partialCyclesSinceFull >= FULL_REFRESH_EVERY);
-    if (havePrevFrame && forceFullRefresh) {
-        Serial.printf("Forcing a full refresh to clear ghosting (%lu partial updates since the last one)\n",
-                      (unsigned long)partialCyclesSinceFull);
+    // Track roughly how long the panel has gone without a full cleaning
+    // flash. Timer wakes each represent one full sleep interval; button
+    // wakes and resets add an unknown amount, counted as zero (erring
+    // toward slightly-too-frequent full refreshes would be fine too).
+    if (wakeupCause == ESP_SLEEP_WAKEUP_TIMER) {
+        sleepSecondsSinceFull += (uint32_t)SLEEP_SECONDS;
     }
 
-    // Render the new frame off-screen, then diff it pixel-for-pixel
-    // against the remembered previous frame to find what changed.
-    renderFrame(lines, batteryPercent);
+    // Force one full flashing refresh to clear partial-update residue
+    // ("ghosting"/graininess, edges first) when either limit is hit -
+    // accumulated time since the last full refresh, or number of partial
+    // updates - whichever comes first.
+    bool forceFullRefresh = !havePrevFrame
+                            || (sleepSecondsSinceFull >= FULL_REFRESH_AFTER_SECONDS)
+                            || (partialCyclesSinceFull >= FULL_REFRESH_EVERY);
+    if (havePrevFrame && forceFullRefresh) {
+        Serial.printf("Forcing a full refresh to clear ghosting (%lu partial updates, ~%lus asleep since the last one)\n",
+                      (unsigned long)partialCyclesSinceFull, (unsigned long)sleepSecondsSinceFull);
+    }
 
     ScreenRect changedWindow;
-    bool pixelsChanged = true; // no previous frame = everything counts as changed
+    bool fieldsChanged = true; // no previous frame = everything counts as changed
     if (havePrevFrame) {
-        pixelsChanged = diffFrames(changedWindow);
+        fieldsChanged = computeChangedWindow(lines, changedWindow);
     }
-    bool needsUpdate = forceFullRefresh || pixelsChanged;
+    bool needsUpdate = forceFullRefresh || fieldsChanged;
 
     if (needsUpdate) {
         if (havePrevFrame && !forceFullRefresh) {
@@ -623,12 +658,11 @@ void setup()
         // initial_refresh=false tells GxEPD2 to trust the panel already
         // shows a valid image and skip its usual full clear on init, so
         // it goes straight into partial-update mode. Only done when we
-        // actually have a remembered previous frame to diff against -
-        // see the note about this near the top of the file. (A forced
-        // anti-ghosting refresh still inits this way - pushing with the
-        // full window is what triggers the flashing waveform.)
+        // actually have a remembered previous frame to diff against. (A
+        // forced anti-ghosting refresh still inits this way - drawing
+        // with the full window is what triggers the flashing waveform.)
         display.init(115200, !havePrevFrame, 20, false);
-        pushFrameToDisplay(forceFullRefresh, changedWindow);
+        drawReadings(lines, batteryPercent, forceFullRefresh, changedWindow);
     } else {
         Serial.println("Nothing changed since last wake - skipping display update");
     }

@@ -1,65 +1,141 @@
-# Waveshare ESP32-S3-ePaper-1.54 — Battery Climate Display
+# Waveshare ESP32-S3-ePaper-1.54 — Humidity-First Climate Display
 
 A PlatformIO / Arduino-framework firmware for the Waveshare
 [ESP32-S3-ePaper-1.54](https://docs.waveshare.com/ESP32-S3-ePaper-1.54)
 board (plain black/white version, hardware revision "V2" — not the
-4-color "1.54G" variant). It reads the onboard temperature/humidity
-sensor and real-time clock, shows them on the e-paper display alongside
-the time and battery level, and deep-sleeps between updates to run for
-a long time off a small LiPo cell.
+4-color "1.54G" variant). It shows relative humidity as the big
+headline reading, with time, date, temperature and battery level around
+it, updates with flicker-free partial refreshes, and deep-sleeps
+between updates to run for a long time off a small LiPo cell.
 
-For the full story of how this firmware was debugged into existence
-(including a nasty RTC library bug and its fix, and research into the
-board's other hardware), see [`NOTES.md`](NOTES.md) in this same folder.
-This README is the "what it does and how to build it" reference; NOTES.md
-is the "why it's built this way" deep-dive.
-
-## What you need
-
-- The Waveshare ESP32-S3-ePaper-1.54 board
-- A USB-C cable
-- [Visual Studio Code](https://code.visualstudio.com/) with the
-  [PlatformIO IDE extension](https://platformio.org/platformio-ide) installed
+**Everything in this README was learned and verified on the real
+board** across an extended debugging effort. The two hard-won rules —
+how to sleep without breaking the display, and how partial updates are
+kept in sync with the layout — are marked clearly below. For the full
+debugging history (the RTC library bug, the failed experiments, the
+board's audio/SD/PMIC research), see [`NOTES.md`](NOTES.md).
 
 ## What it does
 
-- Wakes every 2 minutes (or immediately on a BOOT-button press, or on
-  power-on/reset).
-- Reads the onboard SHTC3 temperature/humidity sensor and the PCF85063
-  real-time clock.
-- Reads the battery voltage and estimates a charge percentage.
-- Draws time, date, temperature, humidity, and battery level on the
-  200x200 e-paper display.
-- Refreshes only the part of the screen that actually changed since the
-  last wake, instead of a full-screen flash every time — **confirmed
-  working on real hardware**, see "Partial updates" below.
-- Stays awake for 30 seconds after drawing (so the reading and Serial
-  output can be observed), then deep-sleeps for 2 minutes.
-- Lights the onboard LED for the whole time it's awake, as a visual
-  "still running" indicator.
-- Sets the RTC's clock from the firmware's build time, but only as a
-  fallback — if the RTC has backup power and a plausible date, its own
-  time is trusted and left alone.
+- Wakes every 2 minutes (`SLEEP_SECONDS`), on a BOOT-button press, or
+  on power-on/reset.
+- Reads the onboard SHTC3 sensor (temperature/humidity), the PCF85063
+  RTC (time/date), and the battery voltage.
+- Draws the display: humidity huge in the center (Orbitron Bold 70)
+  with a stacked %/RH label, time and battery in a top status strip,
+  temperature and date centered below.
+- Refreshes only the screen regions whose values changed — no
+  full-screen flash on a normal update. A full cleaning flash runs
+  automatically every ~30 minutes (see anti-ghosting below).
+- Stays awake `AWAKE_MILLIS` (default 30 s) with the LED on, then
+  deep-sleeps. Average draw is dominated by the ESP32-S3's deep-sleep
+  current (~20–30 µA) plus ~1 µA for the hibernated panel.
+- Sets the RTC from the firmware's build time only when the RTC
+  reports lost backup power or an implausible date; a healthy RTC is
+  never touched.
+
+## THE display rule: never cut the panel's power during sleep
+
+This cost more debugging time than everything else combined, so it
+gets its own section.
+
+The SSD1681 e-paper controller keeps the previously-shown image in
+internal RAM, and **partial (non-flashing) refreshes only work by
+diffing against that RAM**. This firmware therefore sleeps the panel
+with `display.hibernate()` — the controller's own deep-sleep mode
+(~1 µA, RAM retained) — and **keeps the panel's power rail ON through
+deep sleep** (GPIO6 held LOW by `gpio_hold_en`).
+
+An earlier version cut the panel's power rail every sleep to save that
+last ~1 µA. The failure this caused was maddeningly misleading:
+
+- With a **2-minute** sleep, everything looked perfect — the unpowered
+  RAM decayed slowly enough to limp through.
+- With a **5-minute** sleep, the very next partial update dirtied the
+  panel: a grainy band ~5 mm wide around the edges, getting worse each
+  wake.
+
+Two attempted workarounds (tight pixel-diff bounding boxes; rewriting
+the full frame into controller RAM via `epd2.writeImage` before each
+partial refresh) did **not** fix it. Keeping the rail powered fixed it
+completely, at a cost of ~1 µA against the ESP32's own ~20–30 µA sleep
+draw. If you ever "optimize" GPIO6 back to off-during-sleep, this
+whole failure mode returns — and it will look fine in short-interval
+testing.
+
+## Partial updates: how they work, and their one maintenance rule
+
+The firmware remembers the last-drawn text of each field (time, date,
+temperature, humidity, battery) in RTC memory, which survives deep
+sleep. On each wake it compares the fresh values and refreshes only
+the fixed screen region(s) of the field(s) that changed, via GxEPD2's
+`setPartialWindow` + `display.init(115200, false, 20, false)`
+(`initial_refresh=false` — prevents a full-screen flash on every
+wake). If nothing changed, the display isn't touched at all.
+
+**The maintenance rule:** the `*_RECT` table in `main.cpp` is a
+hand-maintained mirror of the layout. If you move a `*_BASELINE` (or
+any drawing position) by more than a few pixels, move its matching
+rect too — a field drawn outside its own rect leaves stale pixels
+behind on partial updates, which looks like ghosting/doubling.
+
+(A "smarter" full-frame pixel-diff version without this rule was tried
+and behaved worse on the real panel; the per-field approach is the one
+that runs clean. Don't resurrect the pixel diff without hardware
+testing.)
+
+### Anti-ghosting
+
+Partial refreshes leave residue behind over time — a property of the
+panel. A full flashing refresh is forced when either limit is hit,
+whichever comes first:
+
+- `FULL_REFRESH_AFTER_SECONDS` (default 1800 ≈ 30 min of accumulated
+  sleep) — the main, time-based limit, so changing `SLEEP_SECONDS`
+  doesn't stretch the cleanup interval;
+- `FULL_REFRESH_EVERY` (default 15 partial updates) — a backstop
+  against many rapid button-press wakes.
+
+## Configuration knobs
+
+All near the top of `src/main.cpp`:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `SLEEP_SECONDS` | 120 | Time between updates (any value is safe for the display now) |
+| `AWAKE_MILLIS` | 30000 | How long the display/LED/Serial stay up before sleeping |
+| `FULL_REFRESH_AFTER_SECONDS` | 1800 | Max accumulated sleep between cleaning flashes |
+| `FULL_REFRESH_EVERY` | 15 | Max partial updates between cleaning flashes |
+| `TOP/HERO/TEMP/DATE_BASELINE`, `HERO_LABEL_DROP` | 22/112/162/196, 36 | Vertical text positions (move the matching `*_RECT` for big moves!) |
+| `VOLT_FULL` / `VOLT_EMPTY` | 4.12 V / 3.0 V | Battery 100%/0% — Waveshare's own factory thresholds, not the textbook 4.2 V |
+
+Horizontal centering is automatic (measured with `getTextBounds`), so
+there are no X positions to maintain.
+
+## Fonts
+
+The display uses three Orbitron fonts in Adafruit GFX format. Their
+header files must sit next to `main.cpp` in `src/`:
+`Orbitron_Bold_70.h` (humidity number), `Orbitron_Bold_32.h`
+(temperature, % sign), `Orbitron_Medium_20.h` (time, date, battery,
+labels). The `GFXfont` symbol inside each header must match the
+filename. The character set must include digits plus `% : / . -`.
 
 ## Getting it running
 
-1. Open this folder in VS Code (`File -> Open Folder...`).
-2. Wait for the PlatformIO icon (an alien head) to appear in the left
-   sidebar — it'll index the project automatically.
-3. Plug the board in over USB-C.
-4. In the blue status bar at the bottom of VS Code, click the checkmark
-   icon to **Build**, then the right-arrow icon to **Upload**. PlatformIO
-   will download the ESP32 toolchain and all required libraries the first
-   time — that can take a few minutes.
-5. Click the plug icon to open the **Serial Monitor** (115200 baud) and
-   watch it print the reading it just took, right before it goes to sleep.
+1. Open this folder in VS Code with the **PlatformIO IDE** extension.
+2. Plug the board in over USB-C.
+3. Build (checkmark) then Upload (arrow) from the PlatformIO toolbar.
+4. Serial Monitor (plug icon) at 115200 baud shows each wake's
+   readings and what kind of display update it performed.
 
-If the upload can't find the board, or it fails partway through: hold the
-**BOOT** button, tap **RESET** (or plug the cable in while still holding
-BOOT), then release BOOT and try Upload again. This forces the ESP32-S3
-into its USB download mode — needed because every deep-sleep cycle drops
-the USB connection entirely (see "Usage notes" below), so it may not be
-sitting at a normal, uploadable boot when you plug in.
+**Uploading while the board is asleep**: the native USB port drops out
+during deep sleep (the board has no separate USB-serial chip), so the
+board disappears and reappears as a USB device every cycle. If an
+upload can't find it: hold **BOOT**, tap **RESET**, release BOOT —
+that forces USB download mode regardless of sleep state.
+
+**Press BOOT** at any time to wake it for a fresh reading immediately.
 
 ### `platformio.ini`
 
@@ -89,188 +165,66 @@ lib_deps =
     https://github.com/SolderedElectronics/Soldered-PCF85063A-RTC-Module-Arduino-Library.git
 ```
 
-All libraries are pulled in automatically — no manual installation
-needed. **Do not** set `board_upload.flash_size` to 16MB or use a
-`default_16MB.csv` partition table — this board only has 8MB of flash.
-That mismatch crash-loops the board before `setup()` ever runs. See
-NOTES.md if you ever hit this.
+Two hard-learned warnings:
 
-## How it works
-
-Everything happens once per wake, inside `setup()`:
-
-1. **Re-latch board power.** This board's battery path only stays on if
-   firmware drives GPIO17 high — that's how the physical power button
-   keeps the board alive after you let go of it. The very first thing
-   the sketch does is set that pin (and GPIO6, the e-paper panel's power
-   switch, and the onboard LED), releasing any "hold" left over from the
-   last deep sleep.
-2. **Read the PCF85063 RTC** over I2C for the current date/time. It runs
-   on its own backup power across sleep cycles, so its clock isn't reset
-   every wake — it's only set from the firmware's build time if the chip
-   reports it lost backup power, or shows an implausible year.
-3. **Read the SHTC3 sensor** over the same I2C bus for temperature and
-   humidity.
-4. **Read the battery voltage** via ADC and estimate a charge percentage.
-5. **Decide what changed** since the last wake (see "Partial updates"
-   below), and draw to the e-paper over SPI using
-   [GxEPD2](https://github.com/ZinggJM/GxEPD2) — refreshing only the
-   changed region where possible.
-6. **Stay awake 30 seconds**, then **go to deep sleep.** The e-paper
-   controller is put into its own low-power mode, its power rail is cut,
-   both power-latch pins are "held" so they survive the ESP32's
-   power-domain shutdown, and `esp_sleep_enable_timer_wakeup()` plus a
-   BOOT-button `ext1` wake schedule the next wake-up.
-
-## Usage notes
-
-- **USB drops out during deep sleep.** The native USB port loses power
-  along with everything else and only comes back once the chip wakes and
-  re-boots. This board only has a native USB-C port (no separate
-  USB-serial chip), so it will briefly disappear and reappear as a USB
-  device every cycle — normal, and only visible while a computer is
-  plugged in.
-- **To force an immediate refresh** instead of waiting out the 2-minute
-  interval, just press BOOT — it's wired as a deep-sleep wake source.
-
-## Configuration
-
-The knobs you're most likely to want to change are all `static const` /
-`const` values near the top of `src/main.cpp` or in the relevant
-function:
-
-| Constant | Default | Meaning |
-|---|---|---|
-| `SLEEP_SECONDS` | 120 | Time between updates |
-| `VOLT_FULL` / `VOLT_EMPTY` (in `batteryPercentFromVoltage`) | 4.12V / 3.0V | Battery 100%/0% thresholds — matches Waveshare's own factory firmware, not the textbook 4.2V |
-| the `delay(30000)` in `setup()` | 30s | How long the display/LED/Serial stay on before sleeping again |
-
-## Partial updates (value remembering)
-
-To avoid a full-screen flash on every wake, the firmware remembers what
-it last drew — in RTC memory, which survives deep sleep — and compares
-the newly-read time/date/temperature/humidity/battery text against that
-memory. Only the on-screen regions that actually changed get refreshed;
-if nothing changed at all, the display isn't touched that cycle.
-
-Each of the five fields (time, date, temperature, humidity, battery) is
-checked independently and owns a fixed region of the screen. Only the
-regions belonging to fields that changed get unioned into that wake's
-refresh window — so if only the minutes ticked over, just the time
-region updates; if temperature also drifted a little, that region gets
-included too, while humidity and battery stay untouched if they didn't
-change.
-
-This relies on GxEPD2's `initial_refresh=false` init option, which
-normally assumes the e-paper panel's own power was never cut — only the
-MCU slept. This firmware cuts the panel's power on every single cycle
-instead (GPIO6, for battery life), which in theory also wipes the SSD1681
-controller's own internal comparison memory that partial updates are
-diffed against. Despite that, **this has been confirmed working well on
-real hardware** — exactly why isn't fully explained from the datasheet
-alone, so treat it as an empirically-verified behavior on this specific
-board/library combination rather than a guaranteed-by-design one. Partial
-refreshes are also known to accumulate slight ghosting over many cycles
-(a property of the panel, not this code) — if that becomes visible after
-extended use, forcing an occasional full refresh (e.g. every N cycles)
-would clear it; not currently implemented.
+- **Do not set flash to 16MB** (`board_upload.flash_size` /
+  `default_16MB.csv`) — the board has 8 MB. The mismatch crash-loops
+  before `setup()` with `spi_flash: Detected size(8192k) smaller than
+  the size in the binary image header(16384k)`.
+- **Do not switch the RTC library to `lewisxhe/SensorLib`** — its
+  `begin()` runs a chip-identity self-test that consistently fails on
+  this exact board (`"Device is offline!"`), even though the RTC is
+  fine. The Soldered library does a plain register read and works.
+  Full story in NOTES.md.
 
 ## Hardware reference
 
 | Signal | GPIO | Notes |
 |---|---|---|
-| e-Paper CS / DC / RST / BUSY / SCK / MOSI | 11 / 10 / 9 / 8 / 12 / 13 | plain default `SPI` object, not a separate `SPIClass` instance |
-| e-Paper panel power switch | 6 | active LOW (LOW = panel on) |
-| Battery power latch | 17 | must be driven HIGH early in boot or the board switches itself off; held across deep sleep |
-| Onboard LED #1 | 3 | active LOW (LOW = on); used here as an "awake" indicator |
-| Battery voltage sense (ADC1 ch3) | 4 | behind a 200k/200k divider — readings need ×2 |
-| BOOT button | 0 | wired up as a deep-sleep wake source |
-| PWR button | 18 | not currently used by this firmware |
-| PCF85063 alarm/interrupt output | 5 | not currently used by this firmware (see NOTES.md for why this isn't a free "fully powered off" wake source) |
-| I2C SDA / SCL (SHTC3, PCF85063) | 47 / 48 | also shared by the ES8311 audio codec (`0x18`) if audio is ever added |
+| e-Paper CS / DC / RST / BUSY / SCK / MOSI | 11 / 10 / 9 / 8 / 12 / 13 | plain default `SPI` object, `SPI.begin(sck, -1, mosi, cs)` |
+| e-Paper panel power switch | 6 | **active LOW** (LOW = on). Held LOW through deep sleep — see THE display rule above. Note: generic AI/internet examples often claim HIGH = on for this pin; Waveshare's own source and this hardware say LOW |
+| Battery power latch | 17 | must be driven HIGH early in boot or the board switches itself off; held HIGH across deep sleep |
+| Onboard LED #1 | 3 | **active LOW** (LOW = on); lit while awake |
+| Battery voltage sense (ADC1 ch3) | 4 | 200k/200k divider — readings ×2 |
+| BOOT button | 0 | deep-sleep wake source (`ext1`, active low) |
+| PWR button | 18 | not used by this firmware |
+| PCF85063 alarm/INT | 5 | not used; usable as an extra `ext1` wake source during deep sleep only (it is NOT wired to turn a fully powered-off board back on — see NOTES.md) |
+| I2C SDA / SCL | 47 / 48 | shared: SHTC3 (0x70), PCF85063 (0x51), and the ES8311 audio codec (0x18) if audio is ever added |
 
-Chip: ESP32-S3-PICO-1-N8R8 (8 MB flash, 8 MB PSRAM, dual-core, Wi-Fi +
-BLE). e-Paper: 200x200, SSD1681 controller (Good Display GDEH0154D67
-panel).
+Chip: ESP32-S3-PICO-1-N8R8 (8 MB flash, 8 MB PSRAM). Panel: 200×200
+SSD1681 (`GxEPD2_154_D67`).
 
-Onboard LED #2 exists but has no known software control — likely a
-hardware-only charge/power indicator (see "Known limitations" below).
-Battery charging status is not exposed to firmware at all on this board.
+RTC quirk: the Soldered library stores years as an offset from 1970,
+so the plausible-year check in the firmware accepts 2024–2069.
 
-This pin map, and the GPIO6/GPIO17 power-latch behavior in particular,
-come from Waveshare's own example firmware for this exact board,
-published at
-[github.com/waveshareteam/ESP32-S3-ePaper-1.54](https://github.com/waveshareteam/ESP32-S3-ePaper-1.54).
-This project reimplements the same behavior as a plain Arduino-framework
-PlatformIO sketch — no LVGL, no ESP-IDF, no GUI-Guider generated UI — so
-it's easier to read, build on, and maintain from VS Code.
+## Known limitations
 
-## Libraries used
-
-| Library | Purpose |
-|---|---|
-| [GxEPD2](https://github.com/ZinggJM/GxEPD2) | Drives the SSD1681 e-paper controller |
-| [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library) | Text/graphics primitives (a GxEPD2 dependency) |
-| [Adafruit SHTC3 Library](https://github.com/adafruit/Adafruit_SHTC3) | Reads the onboard temperature/humidity sensor |
-| [Soldered PCF85063A](https://github.com/SolderedElectronics/Soldered-PCF85063A-RTC-Module-Arduino-Library) | Drives the onboard PCF85063 real-time clock |
-
-All are pulled in automatically by `platformio.ini` — no manual library
-installation needed. (An earlier version of this project used
-`lewisxhe/SensorLib` for the RTC instead; it had a self-test that
-consistently failed on this exact board — see NOTES.md for the full
-story of that bug and its fix.)
-
-## Known limitations / open questions
-
-- **Battery charging status is not exposed to firmware.** Confirmed
-  absent from Waveshare's entire official software repo and their
-  documentation — the onboard PMIC (marked ETA6098) has no
-  firmware-visible interface.
-- **A second onboard LED exists with no known software control.** Likely
-  a hardware-only charge/power-present indicator; unconfirmed without a
-  schematic.
-- **Spare GPIOs are unclear.** Between the display, sensors, buttons,
-  and battery sensing, most commonly-usable pins are already claimed. A
-  handful (GPIO1, 2, 7, 21, 43, 44) appear in no official example, but
-  whether any are broken out to an accessible header pad on this board
-  is unconfirmed.
-- **No compiler/hardware access during development.** This firmware was
-  built and debugged entirely by reading library/vendor source and
-  reasoning from real serial output provided during development — not by
-  local compilation. See NOTES.md for the full story, including one real
-  bug this caused and how it was found. Flag anything that doesn't build
-  or behave as expected and it can be fixed from there.
-
-## Other onboard hardware (researched, not used by this firmware)
-
-The board also has a microphone + speaker (single ES8311 codec) and a
-microSD card slot, neither of which this firmware touches. Pin maps and
-API notes for both are in NOTES.md, under "Other onboard peripherals",
-sourced from Waveshare's official Arduino examples
-(`08_Audio_Test`, `04_SD_Card`).
-
-Waveshare also ships LVGL 8 and 9 as vendorable libraries
-(`01_Arduino_Libraries/lvgl8`/`lvgl9` in their repo) for a fancier UI, but
-their example driving this exact display does so through a completely
-separate raw SPI driver, not GxEPD2 — adopting it as-is would mean
-replacing the display stack this firmware already has working, not
-adding to it. See NOTES.md for the full reasoning.
+- **Battery charging status is not exposed to firmware** — confirmed
+  absent from Waveshare's entire software repo and docs; the PMIC
+  (ETA6098) is a standalone charge-management IC.
+- **A second onboard LED** exists with no software control — likely a
+  hardware-only charge/power indicator.
+- **Spare GPIOs**: essentially every usable pin is claimed by the
+  display, sensors, buttons, SD, and audio (pin maps for the unused SD
+  card and ES8311 mic/speaker are in NOTES.md). GPIO 1, 2, 7, 21, 43,
+  44 appear in no official example, but whether they're broken out is
+  unconfirmed without a schematic.
 
 ## Project files
 
-- `src/main.cpp` — the firmware (always the single source of truth; this
-  is the file to flash).
-- `platformio.ini` — build configuration (see above).
-- `NOTES.md` — the deep debugging history: the RTC library bug and fix,
-  lessons learned, and hardware research (audio/SD/PMIC/GPIOs) not
-  covered in this README.
+- `src/main.cpp` — the firmware, single source of truth.
+- `src/Orbitron_*.h` — the three display fonts (user-provided).
+- `platformio.ini` — build configuration.
+- `NOTES.md` — debugging history and hardware research: the RTC
+  library bug, the display/power saga in full, lessons learned,
+  audio/SD/PMIC/GPIO findings.
 
 ## References
 
 - Waveshare's official example repo:
   https://github.com/waveshareteam/ESP32-S3-ePaper-1.54
-- Independent working Arduino reference for this exact board (the sketch
-  that broke an early I2C debugging deadlock):
+- Independent working Arduino reference for this board:
   https://github.com/VolosR/waveshareEinkMonitor
-- Soldered PCF85063A Arduino library:
+- Soldered PCF85063A RTC library:
   https://github.com/SolderedElectronics/Soldered-PCF85063A-RTC-Module-Arduino-Library
+- GxEPD2: https://github.com/ZinggJM/GxEPD2
